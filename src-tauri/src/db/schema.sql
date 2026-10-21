@@ -21,6 +21,10 @@ CREATE TABLE IF NOT EXISTS batches (
         'running', 'completed', 'completed_with_errors',
         'cancelled', 'interrupted', 'failed'
     )),
+    match_mode TEXT NOT NULL DEFAULT 'exact'
+        CHECK (match_mode IN ('exact', 'visual')),
+    visual_threshold INTEGER NOT NULL DEFAULT 8
+        CHECK (visual_threshold BETWEEN 0 AND 24),
     import_month TEXT NOT NULL,
     started_at TEXT NOT NULL,
     finished_at TEXT,
@@ -51,6 +55,19 @@ CREATE TABLE IF NOT EXISTS images (
     UNIQUE (merchant_id, library_rel_path)
 );
 
+CREATE TABLE IF NOT EXISTS image_visuals (
+    image_id INTEGER PRIMARY KEY REFERENCES images(id) ON DELETE CASCADE,
+    version INTEGER NOT NULL,
+    hash0 INTEGER NOT NULL,
+    hash90 INTEGER NOT NULL,
+    hash180 INTEGER NOT NULL,
+    hash270 INTEGER NOT NULL,
+    aspect_ratio REAL NOT NULL,
+    width INTEGER NOT NULL,
+    height INTEGER NOT NULL,
+    computed_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS batch_items (
     id INTEGER PRIMARY KEY,
     batch_id INTEGER NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
@@ -64,6 +81,10 @@ CREATE TABLE IF NOT EXISTS batch_items (
     outcome TEXT NOT NULL CHECK (outcome IN (
         'unique', 'duplicate_existing', 'duplicate_in_batch', 'skipped', 'error'
     )),
+    duplicate_kind TEXT
+        CHECK (duplicate_kind IS NULL OR duplicate_kind IN ('exact', 'visual')),
+    visual_distance INTEGER
+        CHECK (visual_distance IS NULL OR (visual_distance BETWEEN 0 AND 64)),
     duplicate_of_image_id INTEGER REFERENCES images(id) ON DELETE SET NULL,
     duplicate_of_item_id INTEGER REFERENCES batch_items(id) ON DELETE SET NULL,
     library_rel_path TEXT,

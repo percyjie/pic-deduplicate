@@ -33,7 +33,12 @@ import {
   openResultDir,
   regenerateReport,
 } from "../api/commands";
-import type { BatchDetail, BatchPage, BatchSummary } from "../api/types";
+import type {
+  BatchDetail,
+  BatchPage,
+  BatchSummary,
+  MatchMode,
+} from "../api/types";
 import { useAppStore } from "../store/appStore";
 import {
   batchKindLabel,
@@ -41,7 +46,9 @@ import {
   errorMessage,
   formatDateTime,
   formatNumber,
+  matchModeLabel,
   outcomeLabel,
+  visualThresholdLabel,
 } from "../utils/format";
 
 const { Text } = Typography;
@@ -161,6 +168,8 @@ function HistoryView() {
       merchantId: batch.merchantId,
       kind: batch.batchType,
       sourceDir: batch.sourceAbsPath,
+      matchMode: batch.matchMode,
+      visualThreshold: batch.visualThreshold,
     });
   }
 
@@ -230,6 +239,16 @@ function HistoryView() {
       ),
     },
     {
+      title: "比对",
+      dataIndex: "matchMode",
+      width: 96,
+      render: (value: MatchMode) => (
+        <Tag color={value === "visual" ? "cyan" : "green"}>
+          {matchModeLabel(value)}
+        </Tag>
+      ),
+    },
+    {
       title: "状态",
       dataIndex: "status",
       width: 128,
@@ -270,14 +289,26 @@ function HistoryView() {
       ),
     },
     {
-      title: "重复",
+      title: "重复 / 视觉",
       key: "duplicates",
-      width: 100,
+      width: 128,
       align: "right",
-      render: (_, record) =>
-        formatNumber(
-          record.duplicateExistingCount + record.duplicateInBatchCount,
-        ),
+      render: (_, record) => (
+        <Tooltip title="总重复数 / 其中视觉相似重复数">
+          <span>
+            <strong>
+              {formatNumber(
+                record.duplicateExistingCount +
+                  record.duplicateInBatchCount,
+              )}
+            </strong>
+            <span className="muted">
+              {" "}
+              / {formatNumber(record.visualDuplicateCount)}
+            </span>
+          </span>
+        </Tooltip>
+      ),
     },
     {
       title: "异常 / 警告",
@@ -396,7 +427,7 @@ function HistoryView() {
           loading={loading}
           columns={columns}
           dataSource={data?.items ?? []}
-          scroll={{ x: 1320 }}
+          scroll={{ x: 1460 }}
           locale={{ emptyText: "还没有批次记录。选择商户并开始一次导入吧。" }}
           pagination={{
             current: page,
@@ -441,6 +472,9 @@ function HistoryView() {
                 >
                   {batchKindLabel(detail.batch.batchType)}
                 </Tag>
+                <Tag color={detail.batch.matchMode === "visual" ? "cyan" : "green"}>
+                  {matchModeLabel(detail.batch.matchMode)}
+                </Tag>
                 <span className="muted">
                   {detail.batch.merchantName} ·{" "}
                   {formatDateTime(detail.batch.finishedAt)}
@@ -484,6 +518,23 @@ function HistoryView() {
                     label: "结束时间",
                     children: formatDateTime(detail.batch.finishedAt),
                   },
+                  {
+                    key: "match",
+                    label: "比对方式",
+                    children:
+                      detail.batch.matchMode === "visual" ? (
+                        <span>
+                          {matchModeLabel(detail.batch.matchMode)}
+                          <span className="muted">
+                            {" "}
+                            · 阈值 {detail.batch.visualThreshold}（
+                            {visualThresholdLabel(detail.batch.visualThreshold)}）
+                          </span>
+                        </span>
+                      ) : (
+                        matchModeLabel(detail.batch.matchMode)
+                      ),
+                  },
                 ]}
               />
 
@@ -512,6 +563,16 @@ function HistoryView() {
                   <span>批内重复</span>
                   <strong>
                     {formatNumber(detail.batch.duplicateInBatchCount)}
+                  </strong>
+                </div>
+                <div>
+                  <span>其中视觉相似</span>
+                  <strong
+                    className={
+                      detail.batch.visualDuplicateCount ? "cyan" : ""
+                    }
+                  >
+                    {formatNumber(detail.batch.visualDuplicateCount)}
                   </strong>
                 </div>
                 <div>

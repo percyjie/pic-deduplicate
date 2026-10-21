@@ -48,11 +48,28 @@ impl BatchKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MatchMode {
+    Exact,
+    Visual,
+}
+
+impl MatchMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::Visual => "visual",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum JobPhase {
     Scanning,
     Hashing,
+    Fingerprint,
     Comparing,
     Copying,
     Finalizing,
@@ -174,6 +191,9 @@ pub struct BatchSummary {
     pub skipped_count: u64,
     pub error_count: u64,
     pub warning_count: u64,
+    pub visual_duplicate_count: u64,
+    pub match_mode: String,
+    pub visual_threshold: u32,
     pub report_path: Option<String>,
     pub note: Option<String>,
 }

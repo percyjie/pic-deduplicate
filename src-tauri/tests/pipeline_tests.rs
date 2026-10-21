@@ -7,11 +7,14 @@ use chrono::Local;
 use pic_deduplicate_lib::core::paths::{
     is_supported_image, CONTROL_DIR, DB_FILE, DUPLICATES_DIR, GENERATED_MARKER, UNIQUES_DIR,
 };
-use pic_deduplicate_lib::core::pipeline::{prepare_batch, run_prepared, PreparedBatch};
+use pic_deduplicate_lib::core::pipeline::{
+    prepare_batch, prepare_batch_with_options, run_prepared, BatchOptions, PreparedBatch,
+};
 use pic_deduplicate_lib::core::scan::scan_source;
+use pic_deduplicate_lib::core::visual::DEFAULT_THRESHOLD;
 use pic_deduplicate_lib::db::{self, queries};
 use pic_deduplicate_lib::error::AppError;
-use pic_deduplicate_lib::models::{BatchFinish, BatchKind, ProgressUpdate};
+use pic_deduplicate_lib::models::{BatchFinish, BatchKind, MatchMode, ProgressUpdate};
 use pic_deduplicate_lib::state::RootContext;
 use tempfile::TempDir;
 use walkdir::WalkDir;
@@ -140,6 +143,67 @@ fn execute_ok(
         finish.error
     );
     (prepared, finish)
+}
+
+fn execute_visual_ok(
+    fixture: &Fixture,
+    merchant_id: i64,
+    source: &Path,
+    kind: BatchKind,
+) -> (PreparedBatch, BatchFinish) {
+    let options = BatchOptions {
+        match_mode: MatchMode::Visual,
+        visual_threshold: DEFAULT_THRESHOLD,
+    };
+    let prepared =
+        prepare_batch_with_options(&fixture.context, merchant_id, source, kind, options)
+            .expect("prepare visual batch");
+    let finish = run_prepared(
+        &fixture.context,
+        &prepared,
+        Arc::new(AtomicBool::new(false)),
+        &|_| {},
+    )
+    .expect("run visual batch");
+    assert!(
+        finish.error.is_none(),
+        "unexpected batch error: {:?}",
+        finish.error
+    );
+    (prepared, finish)
+}
+
+fn fixture_path(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/visual")
+        .join(name)
+}
+
+fn copy_fixture(name: &str, dir: &Path, target: &str) {
+    let target_path = dir.join(target);
+    if let Some(parent) = target_path.parent() {
+        fs::create_dir_all(parent).expect("target parent");
+    }
+    fs::copy(fixture_path(name), &target_path).expect("copy fixture");
+}
+
+fn batch_item_rows(
+    fixture: &Fixture,
+    batch_id: i64,
+) -> Vec<(String, String, Option<String>, Option<i64>)> {
+    let db = fixture.context.db.lock().expect("db lock");
+    let mut stmt = db
+        .prepare(
+            "SELECT file_name, outcome, duplicate_kind, visual_distance
+             FROM batch_items WHERE batch_id = ?1 ORDER BY file_name",
+        )
+        .expect("prepare item rows");
+    let rows = stmt
+        .query_map([batch_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .expect("query item rows");
+    rows.map(|row| row.expect("item row")).collect()
 }
 
 #[test]
@@ -495,4 +559,205 @@ fn inspect_source_inside_control_directory_is_rejected() {
     .expect_err("control dir must be rejected");
     assert!(matches!(error, AppError::User { .. }));
     assert_eq!(error.code(), "SOURCE_INSIDE_CONTROL");
+}
+
+#[test]
+fn visual_mode_matches_compressed_resized_and_rotated_library_images() {
+    let fixture = Fixture::new("商户A");
+    copy_fixture("base.png", &fixture.source, "base.png");
+    execute_ok(
+        &fixture,
+        fixture.merchant_id,
+        &fixture.source,
+        BatchKind::InitialImport,
+    );
+    {
+        let db = fixture.context.db.lock().expect("db lock");
+        let visuals: i64 = db
+            .query_row("SELECT COUNT(*) FROM image_visuals", [], |row| row.get(0))
+            .expect("visual count");
+        assert_eq!(visuals, 0, "精确模式不应生成视觉指纹");
+    }
+
+    clear_dir(&fixture.source);
+    copy_fixture("base-q60.jpg", &fixture.source, "compressed.jpg");
+    copy_fixture("base-resized-q55.jpg", &fixture.source, "resized.jpg");
+    copy_fixture("base-rot90.png", &fixture.source, "rotated.png");
+    copy_fixture("other.png", &fixture.source, "other.png");
+
+    let (prepared, finish) = execute_visual_ok(
+        &fixture,
+        fixture.merchant_id,
+        &fixture.source,
+        BatchKind::Daily,
+    );
+    let batch = &finish.batch;
+    assert_eq!(batch.status, "completed");
+    assert_eq!(batch.match_mode, "visual");
+    assert_eq!(batch.visual_threshold, DEFAULT_THRESHOLD);
+    assert_eq!(batch.total_files, 4);
+    assert_eq!(batch.unique_count, 1);
+    assert_eq!(batch.imported_count, 1);
+    assert_eq!(batch.duplicate_existing_count, 3);
+    assert_eq!(batch.duplicate_in_batch_count, 0);
+    assert_eq!(batch.visual_duplicate_count, 3);
+    assert_eq!(batch.error_count, 0);
+    assert_eq!(fixture.image_count(fixture.merchant_id), 2);
+    assert_eq!(image_files(&prepared.library_dir).len(), 2);
+
+    let rows = batch_item_rows(&fixture, prepared.batch_id);
+    assert_eq!(rows.len(), 4);
+    for (name, outcome, kind, distance) in &rows {
+        match name.as_str() {
+            "compressed.jpg" | "resized.jpg" => {
+                assert_eq!(outcome, "duplicate_existing", "{name}");
+                assert_eq!(kind.as_deref(), Some("visual"), "{name}");
+                assert!(
+                    distance.expect("distance") <= DEFAULT_THRESHOLD as i64,
+                    "{name}: {distance:?}"
+                );
+            }
+            "rotated.png" => {
+                assert_eq!(outcome, "duplicate_existing");
+                assert_eq!(kind.as_deref(), Some("visual"));
+                assert_eq!(*distance, Some(0));
+            }
+            "other.png" => {
+                assert_eq!(outcome, "unique");
+                assert!(kind.is_none());
+                assert!(distance.is_none());
+            }
+            other => panic!("unexpected file {other}"),
+        }
+    }
+
+    let db = fixture.context.db.lock().expect("db lock");
+    let visual_rows: i64 = db
+        .query_row("SELECT COUNT(*) FROM image_visuals", [], |row| row.get(0))
+        .expect("visual count");
+    assert_eq!(visual_rows, 2, "主库退回应补齐视觉指纹，新图片也应入库指纹");
+    drop(db);
+
+    let bytes = fs::read(prepared.result_dir.join("批次报告.csv")).expect("read csv");
+    let text = std::str::from_utf8(&bytes[3..]).expect("utf-8 csv");
+    let mut reader = csv::ReaderBuilder::new().from_reader(text.as_bytes());
+    let headers = reader.headers().expect("headers").clone();
+    assert_eq!(&headers[15], "匹配方式");
+    assert_eq!(&headers[16], "视觉差异");
+    let records: Vec<csv::StringRecord> = reader.records().map(|r| r.unwrap()).collect();
+    let compressed = records
+        .iter()
+        .find(|record| &record[1] == "compressed.jpg")
+        .expect("compressed row");
+    assert_eq!(&compressed[7], "主库视觉相似");
+    assert_eq!(&compressed[15], "视觉相似");
+    let distance: u32 = compressed[16].parse().expect("visual distance");
+    assert!(distance <= DEFAULT_THRESHOLD);
+
+    let summary: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(prepared.result_dir.join("批次摘要.json")).expect("summary file"),
+    )
+    .expect("summary json");
+    assert_eq!(summary["matchMode"], "visual");
+    assert_eq!(summary["visualThreshold"], DEFAULT_THRESHOLD);
+}
+
+#[test]
+fn visual_mode_dedupes_rotated_and_compressed_files_inside_batch() {
+    let fixture = Fixture::new("商户A");
+    copy_fixture("base.png", &fixture.source, "a.png");
+    copy_fixture("base-rot90.png", &fixture.source, "b.png");
+    copy_fixture("base-q60.jpg", &fixture.source, "c.jpg");
+    copy_fixture("other.png", &fixture.source, "d.png");
+
+    let (prepared, finish) = execute_visual_ok(
+        &fixture,
+        fixture.merchant_id,
+        &fixture.source,
+        BatchKind::InitialImport,
+    );
+    let batch = &finish.batch;
+    assert_eq!(batch.status, "completed");
+    assert_eq!(batch.total_files, 4);
+    assert_eq!(batch.unique_count, 2);
+    assert_eq!(batch.imported_count, 2);
+    assert_eq!(batch.duplicate_in_batch_count, 2);
+    assert_eq!(batch.visual_duplicate_count, 2);
+    assert_eq!(batch.error_count, 0);
+    assert_eq!(fixture.image_count(fixture.merchant_id), 2);
+    assert_eq!(image_files(&prepared.library_dir).len(), 2);
+
+    let rows = batch_item_rows(&fixture, prepared.batch_id);
+    let visual_duplicates: Vec<_> = rows
+        .iter()
+        .filter(|row| row.1 == "duplicate_in_batch")
+        .collect();
+    assert_eq!(visual_duplicates.len(), 2);
+    assert!(visual_duplicates
+        .iter()
+        .all(|row| row.2.as_deref() == Some("visual")));
+    assert!(visual_duplicates
+        .iter()
+        .all(|row| row.3.expect("distance") <= DEFAULT_THRESHOLD as i64));
+}
+
+#[test]
+fn exact_mode_treats_visually_similar_images_as_new() {
+    let fixture = Fixture::new("商户A");
+    copy_fixture("base.png", &fixture.source, "base.png");
+    execute_ok(
+        &fixture,
+        fixture.merchant_id,
+        &fixture.source,
+        BatchKind::InitialImport,
+    );
+
+    clear_dir(&fixture.source);
+    copy_fixture("base-q60.jpg", &fixture.source, "compressed.jpg");
+    copy_fixture("base-rot90.png", &fixture.source, "rotated.png");
+
+    let (_, finish) = execute_ok(
+        &fixture,
+        fixture.merchant_id,
+        &fixture.source,
+        BatchKind::Daily,
+    );
+    let batch = &finish.batch;
+    assert_eq!(batch.match_mode, "exact");
+    assert_eq!(batch.unique_count, 2);
+    assert_eq!(batch.imported_count, 2);
+    assert_eq!(batch.duplicate_existing_count, 0);
+    assert_eq!(batch.visual_duplicate_count, 0);
+    assert_eq!(fixture.image_count(fixture.merchant_id), 3);
+}
+
+#[test]
+fn visual_mode_imports_low_detail_images_with_warning() {
+    let fixture = Fixture::new("商户A");
+    copy_fixture("solid.png", &fixture.source, "solid.png");
+
+    let (prepared, finish) = execute_visual_ok(
+        &fixture,
+        fixture.merchant_id,
+        &fixture.source,
+        BatchKind::InitialImport,
+    );
+    let batch = &finish.batch;
+    assert_eq!(batch.status, "completed");
+    assert_eq!(batch.unique_count, 1);
+    assert_eq!(batch.imported_count, 1);
+    assert_eq!(batch.warning_count, 1);
+    assert_eq!(batch.error_count, 0);
+    assert_eq!(batch.visual_duplicate_count, 0);
+
+    let db = fixture.context.db.lock().expect("db lock");
+    let (code, message): (Option<String>, Option<String>) = db
+        .query_row(
+            "SELECT warning_code, warning_message FROM batch_items WHERE batch_id = ?1",
+            [prepared.batch_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("warning row");
+    assert_eq!(code.as_deref(), Some("VISUAL_UNAVAILABLE"));
+    assert!(message.unwrap_or_default().contains("仅参与精确比对"));
 }

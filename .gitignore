@@ -12,6 +12,14 @@ dist
 dist-ssr
 *.local
 
+# Local release artifacts
+.build/
+release/
+
+# Local SSH key material (never commit)
+/y
+/y.pub
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

@@ -4,6 +4,7 @@ use std::path::Path;
 use chrono::Local;
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
+use crate::core::visual::{VisualHashes, HASH_VERSION};
 use crate::error::{AppError, AppResult};
 use crate::models::{BatchIssue, BatchPage, BatchSummary, MerchantSummary};
 
@@ -20,6 +21,31 @@ pub struct LibraryImage {
     pub library_rel_path: String,
     pub original_name: String,
     pub imported_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct LibraryVisual {
+    pub image_id: i64,
+    pub size_bytes: i64,
+    pub library_rel_path: String,
+    pub original_name: String,
+    pub imported_at: String,
+    pub rotations: [u64; 4],
+    pub aspect_ratio: f32,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingVisual {
+    pub image_id: i64,
+    pub library_rel_path: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewImageVisual {
+    pub image_id: i64,
+    pub hashes: VisualHashes,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -49,6 +75,8 @@ pub struct NewBatchItem {
     pub mtime_ms: Option<i64>,
     pub sha256: Option<String>,
     pub outcome: String,
+    pub duplicate_kind: Option<String>,
+    pub visual_distance: Option<u32>,
     pub duplicate_of_image_id: Option<i64>,
     pub duplicate_of_seq: Option<i64>,
     pub error_code: Option<String>,
@@ -66,6 +94,7 @@ pub struct NewLibraryImage {
     pub original_source_path: String,
     pub imported_at: String,
     pub batch_id: i64,
+    pub visual: Option<VisualHashes>,
 }
 
 #[derive(Debug, Clone)]
@@ -77,6 +106,8 @@ pub struct BatchReportItem {
     pub size_bytes: Option<i64>,
     pub sha256: Option<String>,
     pub outcome: String,
+    pub duplicate_kind: Option<String>,
+    pub visual_distance: Option<u32>,
     pub library_rel_path: Option<String>,
     pub result_rel_path: Option<String>,
     pub error_code: Option<String>,
@@ -94,7 +125,10 @@ SELECT b.id, b.merchant_id, m.folder_name, b.batch_type, b.source_abs_path,
        b.result_rel_path, b.status, b.started_at, b.finished_at, b.total_files,
        b.unique_count, b.imported_count, b.duplicate_existing_count,
        b.duplicate_in_batch_count, b.skipped_count, b.error_count,
-       b.warning_count, b.report_rel_path, b.note
+       b.warning_count, b.report_rel_path, b.note, b.match_mode,
+       b.visual_threshold,
+       (SELECT COUNT(*) FROM batch_items bi
+        WHERE bi.batch_id = b.id AND bi.duplicate_kind = 'visual')
 FROM batches b
 JOIN merchants m ON m.id = b.merchant_id";
 
@@ -184,10 +218,13 @@ pub fn merchant_summaries(conn: &Connection, root: &Path) -> AppResult<Vec<Merch
     Ok(result)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn insert_running_batch(
     conn: &Connection,
     merchant_id: i64,
     batch_type: &str,
+    match_mode: &str,
+    visual_threshold: u32,
     source_abs_path: &str,
     result_rel_path: &str,
     import_month: &str,
@@ -195,12 +232,14 @@ pub fn insert_running_batch(
 ) -> AppResult<i64> {
     conn.execute(
         "INSERT INTO batches (
-            merchant_id, batch_type, source_abs_path, result_rel_path, status,
-            import_month, started_at
-         ) VALUES (?1, ?2, ?3, ?4, 'running', ?5, ?6)",
+            merchant_id, batch_type, match_mode, visual_threshold, source_abs_path,
+            result_rel_path, status, import_month, started_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7, ?8)",
         params![
             merchant_id,
             batch_type,
+            match_mode,
+            visual_threshold as i64,
             source_abs_path,
             result_rel_path,
             import_month,
@@ -356,6 +395,151 @@ pub fn load_library_images(
     Ok(result)
 }
 
+pub fn load_library_visuals(
+    conn: &Connection,
+    merchant_id: i64,
+    version: i64,
+) -> AppResult<Vec<LibraryVisual>> {
+    let mut stmt = conn.prepare(
+        "SELECT i.id, i.size_bytes, i.library_rel_path, i.original_name, i.imported_at,
+                v.hash0, v.hash90, v.hash180, v.hash270, v.aspect_ratio, v.width, v.height
+         FROM images i
+         JOIN image_visuals v ON v.image_id = i.id
+         WHERE i.merchant_id = ?1 AND v.version = ?2",
+    )?;
+    let rows = stmt.query_map(params![merchant_id, version], |row| {
+        let aspect_ratio: f64 = row.get(9)?;
+        Ok(LibraryVisual {
+            image_id: row.get(0)?,
+            size_bytes: row.get(1)?,
+            library_rel_path: row.get(2)?,
+            original_name: row.get(3)?,
+            imported_at: row.get(4)?,
+            rotations: [
+                row.get::<_, i64>(5)? as u64,
+                row.get::<_, i64>(6)? as u64,
+                row.get::<_, i64>(7)? as u64,
+                row.get::<_, i64>(8)? as u64,
+            ],
+            aspect_ratio: aspect_ratio as f32,
+            width: row.get::<_, i64>(10)?.max(0) as u32,
+            height: row.get::<_, i64>(11)?.max(0) as u32,
+        })
+    })?;
+    let mut result = Vec::new();
+    for row in rows {
+        result.push(row?);
+    }
+    Ok(result)
+}
+
+pub fn load_pending_visuals(
+    conn: &Connection,
+    merchant_id: i64,
+    version: i64,
+) -> AppResult<Vec<PendingVisual>> {
+    let mut stmt = conn.prepare(
+        "SELECT i.id, i.library_rel_path
+         FROM images i
+         LEFT JOIN image_visuals v ON v.image_id = i.id AND v.version = ?2
+         WHERE i.merchant_id = ?1 AND v.image_id IS NULL
+         ORDER BY i.id",
+    )?;
+    let rows = stmt.query_map(params![merchant_id, version], |row| {
+        Ok(PendingVisual {
+            image_id: row.get(0)?,
+            library_rel_path: row.get(1)?,
+        })
+    })?;
+    let mut result = Vec::new();
+    for row in rows {
+        result.push(row?);
+    }
+    Ok(result)
+}
+
+pub fn save_image_visuals(
+    conn: &mut Connection,
+    items: &[NewImageVisual],
+    computed_at: &str,
+) -> AppResult<()> {
+    if items.is_empty() {
+        return Ok(());
+    }
+    let tx = conn.transaction()?;
+    {
+        let mut stmt = tx.prepare(
+            "INSERT INTO image_visuals (
+                image_id, version, hash0, hash90, hash180, hash270,
+                aspect_ratio, width, height, computed_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(image_id) DO UPDATE SET
+                version = excluded.version,
+                hash0 = excluded.hash0,
+                hash90 = excluded.hash90,
+                hash180 = excluded.hash180,
+                hash270 = excluded.hash270,
+                aspect_ratio = excluded.aspect_ratio,
+                width = excluded.width,
+                height = excluded.height,
+                computed_at = excluded.computed_at",
+        )?;
+        for item in items {
+            stmt.execute(params![
+                item.image_id,
+                HASH_VERSION,
+                item.hashes.rotations[0] as i64,
+                item.hashes.rotations[1] as i64,
+                item.hashes.rotations[2] as i64,
+                item.hashes.rotations[3] as i64,
+                item.hashes.aspect_ratio() as f64,
+                item.hashes.width as i64,
+                item.hashes.height as i64,
+                computed_at,
+            ])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn insert_image_visual(
+    conn: &Connection,
+    image_id: i64,
+    hashes: &VisualHashes,
+    computed_at: &str,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO image_visuals (
+            image_id, version, hash0, hash90, hash180, hash270,
+            aspect_ratio, width, height, computed_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         ON CONFLICT(image_id) DO UPDATE SET
+            version = excluded.version,
+            hash0 = excluded.hash0,
+            hash90 = excluded.hash90,
+            hash180 = excluded.hash180,
+            hash270 = excluded.hash270,
+            aspect_ratio = excluded.aspect_ratio,
+            width = excluded.width,
+            height = excluded.height,
+            computed_at = excluded.computed_at",
+        params![
+            image_id,
+            HASH_VERSION,
+            hashes.rotations[0] as i64,
+            hashes.rotations[1] as i64,
+            hashes.rotations[2] as i64,
+            hashes.rotations[3] as i64,
+            hashes.aspect_ratio() as f64,
+            hashes.width as i64,
+            hashes.height as i64,
+            computed_at,
+        ],
+    )?;
+    Ok(())
+}
+
 pub fn insert_batch_items(
     conn: &mut Connection,
     batch_id: i64,
@@ -368,9 +552,10 @@ pub fn insert_batch_items(
         let mut stmt = tx.prepare(
             "INSERT INTO batch_items (
                 batch_id, seq, source_abs_path, source_rel_path, file_name, size_bytes,
-                mtime_ms, sha256, outcome, duplicate_of_image_id, duplicate_of_item_id,
+                mtime_ms, sha256, outcome, duplicate_kind, visual_distance,
+                duplicate_of_image_id, duplicate_of_item_id,
                 error_code, error_message, warning_code, warning_message
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
         )?;
         for item in items {
             let duplicate_item_id = match item.duplicate_of_seq {
@@ -389,6 +574,8 @@ pub fn insert_batch_items(
                 item.mtime_ms,
                 item.sha256,
                 item.outcome,
+                item.duplicate_kind,
+                item.visual_distance.map(|value| value as i64),
                 item.duplicate_of_image_id,
                 duplicate_item_id,
                 item.error_code,
@@ -428,6 +615,9 @@ pub fn commit_library_image(
         ],
     )?;
     let image_id = tx.last_insert_rowid();
+    if let Some(hashes) = &image.visual {
+        insert_image_visual(&tx, image_id, hashes, &image.imported_at)?;
+    }
     tx.execute(
         "UPDATE batch_items SET library_rel_path = ?2 WHERE id = ?1",
         params![batch_item_id, image.library_rel_path],
@@ -586,7 +776,8 @@ pub fn report_items(conn: &Connection, batch_id: i64) -> AppResult<Vec<BatchRepo
                 bi.size_bytes, bi.sha256, bi.outcome, bi.library_rel_path,
                 bi.result_rel_path, bi.error_code, bi.error_message, bi.warning_code,
                 bi.warning_message, img.original_name, img.library_rel_path,
-                dup.file_name, dup.source_abs_path
+                dup.file_name, dup.source_abs_path, bi.duplicate_kind,
+                bi.visual_distance
          FROM batch_items bi
          LEFT JOIN images img ON img.id = bi.duplicate_of_image_id
          LEFT JOIN batch_items dup ON dup.id = bi.duplicate_of_item_id
@@ -602,6 +793,8 @@ pub fn report_items(conn: &Connection, batch_id: i64) -> AppResult<Vec<BatchRepo
             size_bytes: row.get(4)?,
             sha256: row.get(5)?,
             outcome: row.get(6)?,
+            duplicate_kind: row.get(17)?,
+            visual_distance: row.get::<_, Option<i64>>(18)?.map(|value| value as u32),
             library_rel_path: row.get(7)?,
             result_rel_path: row.get(8)?,
             error_code: row.get(9)?,
@@ -649,6 +842,9 @@ fn row_to_batch_summary(row: &Row<'_>, root: &Path) -> rusqlite::Result<BatchSum
         report_path: report_rel_path
             .map(|path| root.join(path).to_string_lossy().to_string()),
         note: row.get(18)?,
+        match_mode: row.get(19)?,
+        visual_threshold: row.get::<_, i64>(20)?.max(0) as u32,
+        visual_duplicate_count: to_u64(row.get::<_, i64>(21)?),
     })
 }
 

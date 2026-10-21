@@ -116,7 +116,7 @@ function WelcomeView() {
           <h1>
             本地图片
             <br />
-            <span>精确去重</span>
+            <span>智能去重</span>
           </h1>
           <p className="welcome-lead">
             按商户维护唯一图片主库。每次导入与主库逐一比对，重复与不重复图片自动按批次归档。
@@ -154,8 +154,8 @@ function WelcomeView() {
             <div>
               <SafetyCertificateOutlined />
               <span>
-                <strong>SHA-256 精确比对</strong>
-                同一文件才判重，零误判
+                <strong>精确 + 视觉比对</strong>
+                SHA-256 判重，可选识别压缩、缩放与 90° 旋转
               </span>
             </div>
             <div>

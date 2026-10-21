@@ -17,6 +17,8 @@ fn sample_item(seq: i64, file_name: &str, outcome: &str) -> BatchReportItem {
         size_bytes: Some(16),
         sha256: Some("a".repeat(64)),
         outcome: outcome.to_string(),
+        duplicate_kind: None,
+        visual_distance: None,
         library_rel_path: None,
         result_rel_path: None,
         error_code: None,
@@ -57,6 +59,7 @@ fn csv_report_has_bom_crlf_escaping_and_formula_guard() {
     formula.duplicate_image_name = Some("主库图.jpg".to_string());
     formula.duplicate_image_path =
         Some("商户A/图片主库/2026-10/主库图__abc.jpg".to_string());
+    formula.duplicate_kind = Some("exact".to_string());
 
     let mut broken = sample_item(2, "损坏图片.png", "error");
     broken.sha256 = None;
@@ -78,6 +81,8 @@ fn csv_report_has_bom_crlf_escaping_and_formula_guard() {
         started_at: "2026-10-20T10:00:00+08:00",
         finished_at: "2026-10-20T10:05:00+08:00",
         status: "completed_with_errors",
+        match_mode: "visual",
+        visual_threshold: 8,
     };
 
     let (report_rel, summary_rel) =
@@ -95,9 +100,11 @@ fn csv_report_has_bom_crlf_escaping_and_formula_guard() {
 
     let mut reader = csv::ReaderBuilder::new().from_reader(text.as_bytes());
     let headers = reader.headers().unwrap().clone();
-    assert_eq!(headers.len(), 15);
+    assert_eq!(headers.len(), 17);
     assert_eq!(&headers[0], "序号");
     assert_eq!(&headers[14], "警告信息");
+    assert_eq!(&headers[15], "匹配方式");
+    assert_eq!(&headers[16], "视觉差异");
 
     let records: Vec<csv::StringRecord> = reader.records().map(|r| r.unwrap()).collect();
     assert_eq!(records.len(), 3);
@@ -107,6 +114,8 @@ fn csv_report_has_bom_crlf_escaping_and_formula_guard() {
     assert_eq!(&records[0][6], "重复（主库已有）");
     assert_eq!(&records[0][7], "已有主库");
     assert!(records[0][8].contains("主库图.jpg"));
+    assert_eq!(&records[0][15], "精确哈希");
+    assert_eq!(&records[0][16], "");
 
     assert_eq!(&records[1][12], "读取失败，\n原因：\"文件被占用\"");
     assert_eq!(&records[1][6], "处理失败");
@@ -118,6 +127,8 @@ fn csv_report_has_bom_crlf_escaping_and_formula_guard() {
         serde_json::from_str(&fs::read_to_string(result_dir.join(SUMMARY_FILE)).unwrap()).unwrap();
     assert_eq!(summary["batchId"], 7);
     assert_eq!(summary["status"], "completed_with_errors");
+    assert_eq!(summary["matchMode"], "visual");
+    assert_eq!(summary["visualThreshold"], 8);
     assert_eq!(summary["counts"]["errors"], 1);
     assert_eq!(summary["scanWarnings"][0], "扫描提示");
     assert!(summary["fatalError"].is_null());
@@ -133,6 +144,8 @@ fn new_batch_item(seq: i64, file_name: &str, hash: &str) -> NewBatchItem {
         mtime_ms: None,
         sha256: Some(hash.to_string()),
         outcome: "unique".to_string(),
+        duplicate_kind: None,
+        visual_distance: None,
         duplicate_of_image_id: None,
         duplicate_of_seq: None,
         error_code: None,
@@ -152,6 +165,7 @@ fn new_image(merchant_id: i64, hash: &str, library_rel_path: &str) -> NewLibrary
         original_source_path: r"E:\来源\a.jpg".to_string(),
         imported_at: "2026-10-20T10:00:00+08:00".to_string(),
         batch_id: 1,
+        visual: None,
     }
 }
 
@@ -168,6 +182,8 @@ fn database_enforces_unique_hash_per_merchant_and_unique_result_path() {
         &conn,
         merchant_a,
         "initial_import",
+        "exact",
+        8,
         r"E:\来源",
         "商户A/去重结果/批次1",
         "2026-10",
@@ -180,6 +196,8 @@ fn database_enforces_unique_hash_per_merchant_and_unique_result_path() {
             &conn,
             merchant_a,
             "daily",
+            "exact",
+            8,
             r"E:\来源2",
             "商户a/去重结果/批次1",
             "2026-10",
@@ -207,6 +225,8 @@ fn database_enforces_unique_hash_per_merchant_and_unique_result_path() {
         &conn,
         merchant_a,
         "daily",
+        "exact",
+        8,
         r"E:\来源2",
         "商户A/去重结果/批次2",
         "2026-10",
@@ -233,6 +253,8 @@ fn database_enforces_unique_hash_per_merchant_and_unique_result_path() {
         &conn,
         merchant_b,
         "initial_import",
+        "exact",
+        8,
         r"E:\来源",
         "商户B/去重结果/批次1",
         "2026-10",
@@ -280,6 +302,8 @@ fn database_reopen_is_idempotent_and_interrupts_running_batches() {
             &conn,
             merchant_id,
             "daily",
+            "exact",
+            8,
             r"E:\来源",
             "商户A/去重结果/批次1",
             "2026-10",

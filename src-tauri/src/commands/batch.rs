@@ -7,12 +7,13 @@ use chrono::Local;
 use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
 
-use crate::core::pipeline::{self, PreparedBatch};
+use crate::core::pipeline::{self, BatchOptions, PreparedBatch};
+use crate::core::visual;
 use crate::db::queries;
 use crate::error::{AppError, AppResult};
 use crate::models::{
     ActiveJobSnapshot, BatchDetail, BatchKind, BatchPage, BatchSummary, JobFinishedPayload,
-    JobProgress, ProgressUpdate, StartBatchResult,
+    JobProgress, MatchMode, ProgressUpdate, StartBatchResult,
 };
 use crate::state::{ActiveJob, AppState, RootContext};
 
@@ -23,12 +24,18 @@ pub async fn start_batch(
     merchant_id: i64,
     source_dir: String,
     kind: BatchKind,
+    match_mode: Option<MatchMode>,
+    visual_threshold: Option<u32>,
 ) -> AppResult<StartBatchResult> {
     let context = reserve_start(&state)?;
     let source = PathBuf::from(source_dir);
+    let options = BatchOptions {
+        match_mode: match_mode.unwrap_or(MatchMode::Exact),
+        visual_threshold: visual_threshold.unwrap_or(visual::DEFAULT_THRESHOLD),
+    };
     let prepare_context = context.clone();
     let prepared = match tauri::async_runtime::spawn_blocking(move || {
-        pipeline::prepare_batch(&prepare_context, merchant_id, &source, kind)
+        pipeline::prepare_batch_with_options(&prepare_context, merchant_id, &source, kind, options)
     })
     .await
     {

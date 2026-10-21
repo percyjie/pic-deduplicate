@@ -19,10 +19,29 @@ use crate::core::paths::{
 };
 use crate::core::report::{write_batch_reports, ReportMeta};
 use crate::core::scan::{scan_source, ScannedFile};
-use crate::db::queries::{self, BatchCounts, BatchReportItem, NewBatchItem, NewLibraryImage};
+use crate::core::visual::{self, VisualHashes, HASH_VERSION};
+use crate::db::queries::{
+    self, BatchCounts, BatchReportItem, LibraryImage, LibraryVisual, NewBatchItem,
+    NewImageVisual, NewLibraryImage,
+};
 use crate::error::{AppError, AppResult};
-use crate::models::{BatchFinish, BatchKind, JobPhase, ProgressUpdate};
+use crate::models::{BatchFinish, BatchKind, JobPhase, MatchMode, ProgressUpdate};
 use crate::state::RootContext;
+
+#[derive(Debug, Clone, Copy)]
+pub struct BatchOptions {
+    pub match_mode: MatchMode,
+    pub visual_threshold: u32,
+}
+
+impl Default for BatchOptions {
+    fn default() -> Self {
+        Self {
+            match_mode: MatchMode::Exact,
+            visual_threshold: visual::DEFAULT_THRESHOLD,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct PreparedBatch {
@@ -30,6 +49,8 @@ pub struct PreparedBatch {
     pub merchant_id: i64,
     pub merchant_name: String,
     pub kind: BatchKind,
+    pub match_mode: MatchMode,
+    pub visual_threshold: u32,
     pub source: PathBuf,
     pub result_dir: PathBuf,
     pub result_rel_path: String,
@@ -44,6 +65,20 @@ pub fn prepare_batch(
     source: &Path,
     kind: BatchKind,
 ) -> AppResult<PreparedBatch> {
+    prepare_batch_with_options(ctx, merchant_id, source, kind, BatchOptions::default())
+}
+
+pub fn prepare_batch_with_options(
+    ctx: &RootContext,
+    merchant_id: i64,
+    source: &Path,
+    kind: BatchKind,
+    options: BatchOptions,
+) -> AppResult<PreparedBatch> {
+    let options = BatchOptions {
+        match_mode: options.match_mode,
+        visual_threshold: options.visual_threshold.min(visual::MAX_THRESHOLD),
+    };
     let merchant = {
         let db = lock_db(ctx)?;
         queries::find_merchant(&db, merchant_id)?
@@ -97,6 +132,8 @@ pub fn prepare_batch(
             &db,
             merchant_id,
             kind.as_str(),
+            options.match_mode.as_str(),
+            options.visual_threshold,
             &absolute_string(&source),
             &result_rel_path,
             &import_month,
@@ -109,6 +146,8 @@ pub fn prepare_batch(
         merchant_id,
         merchant_name: merchant.folder_name,
         kind,
+        match_mode: options.match_mode,
+        visual_threshold: options.visual_threshold,
         source,
         result_dir: batch_dir,
         result_rel_path,
@@ -173,9 +212,18 @@ fn execute(
         ..Default::default()
     });
 
-    hash_all(&mut state.items, cancel, progress)?;
+    let pool = build_worker_pool()?;
+    hash_all(&mut state.items, &pool, cancel, progress)?;
     if cancel.load(Ordering::Relaxed) {
         return Err(AppError::Cancelled);
+    }
+
+    if prepared.match_mode == MatchMode::Visual {
+        ensure_library_visuals(ctx, prepared, &pool, cancel, progress)?;
+        visual_hash_items(&mut state.items, &pool, cancel, progress)?;
+        if cancel.load(Ordering::Relaxed) {
+            return Err(AppError::Cancelled);
+        }
     }
 
     let mut counts = BatchCounts {
@@ -217,8 +265,22 @@ fn execute(
     Ok(())
 }
 
+fn build_worker_pool() -> AppResult<rayon::ThreadPool> {
+    let threads = std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(4)
+        .min(4);
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .map_err(|error| {
+            AppError::user("THREAD_POOL_FAILED", format!("无法启动处理线程：{error}"))
+        })
+}
+
 fn hash_all(
     items: &mut [WorkItem],
+    pool: &rayon::ThreadPool,
     cancel: &AtomicBool,
     progress: &(dyn Fn(ProgressUpdate) + Send + Sync),
 ) -> AppResult<()> {
@@ -237,16 +299,6 @@ fn hash_all(
     });
 
     let processed = AtomicU64::new(0);
-    let threads = std::thread::available_parallelism()
-        .map(|value| value.get())
-        .unwrap_or(4)
-        .min(4);
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(threads)
-        .build()
-        .map_err(|error| {
-            AppError::user("THREAD_POOL_FAILED", format!("无法启动哈希线程：{error}"))
-        })?;
 
     pool.install(|| {
         items.par_iter_mut().for_each(|item| {
@@ -281,6 +333,120 @@ fn hash_all(
     Ok(())
 }
 
+fn ensure_library_visuals(
+    ctx: &RootContext,
+    prepared: &PreparedBatch,
+    pool: &rayon::ThreadPool,
+    cancel: &AtomicBool,
+    progress: &(dyn Fn(ProgressUpdate) + Send + Sync),
+) -> AppResult<()> {
+    let pending = {
+        let db = lock_db(ctx)?;
+        queries::load_pending_visuals(&db, prepared.merchant_id, HASH_VERSION)?
+    };
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    let total = pending.len() as u64;
+    progress(ProgressUpdate {
+        phase: JobPhase::Fingerprint,
+        total,
+        message: Some(format!("正在为主库 {total} 张图片建立视觉指纹…")),
+        ..Default::default()
+    });
+
+    let processed = AtomicU64::new(0);
+    let results: Vec<NewImageVisual> = pool.install(|| {
+        pending
+            .par_iter()
+            .filter_map(|entry| {
+                if cancel.load(Ordering::Relaxed) {
+                    return None;
+                }
+                let path = rel_to_path(&ctx.root, &entry.library_rel_path);
+                let hashes = visual::compute(&path).ok();
+                let done = processed.fetch_add(1, Ordering::Relaxed) + 1;
+                if done == total || done % 64 == 0 {
+                    progress(ProgressUpdate {
+                        phase: JobPhase::Fingerprint,
+                        processed: done,
+                        total,
+                        message: Some(format!("主库视觉指纹 {done}/{total}")),
+                        ..Default::default()
+                    });
+                }
+                hashes.map(|hashes| NewImageVisual {
+                    image_id: entry.image_id,
+                    hashes,
+                })
+            })
+            .collect()
+    });
+
+    {
+        let mut db = lock_db(ctx)?;
+        queries::save_image_visuals(&mut db, &results, &Local::now().to_rfc3339())?;
+    }
+    if cancel.load(Ordering::Relaxed) {
+        return Err(AppError::Cancelled);
+    }
+    Ok(())
+}
+
+fn visual_hash_items(
+    items: &mut [WorkItem],
+    pool: &rayon::ThreadPool,
+    cancel: &AtomicBool,
+    progress: &(dyn Fn(ProgressUpdate) + Send + Sync),
+) -> AppResult<()> {
+    let total = items
+        .iter()
+        .filter(|item| item.file.size_bytes > 0 && item.outcome.as_deref() != Some("error"))
+        .count() as u64;
+    if total == 0 {
+        return Ok(());
+    }
+    progress(ProgressUpdate {
+        phase: JobPhase::Fingerprint,
+        total,
+        message: Some("正在生成来源图片的视觉指纹…".to_string()),
+        ..Default::default()
+    });
+
+    let processed = AtomicU64::new(0);
+    pool.install(|| {
+        items.par_iter_mut().for_each(|item| {
+            if item.file.size_bytes <= 0 || item.outcome.as_deref() == Some("error") {
+                return;
+            }
+            if cancel.load(Ordering::Relaxed) {
+                return;
+            }
+            match visual::compute(&item.file.abs_path) {
+                Ok(hashes) => item.visual = Some(hashes),
+                Err(AppError::Cancelled) => {}
+                Err(error) => {
+                    item.warning_code = Some("VISUAL_UNAVAILABLE".to_string());
+                    item.warning_message =
+                        Some(format!("{error}本文件仅参与精确比对。"));
+                }
+            }
+            let done = processed.fetch_add(1, Ordering::Relaxed) + 1;
+            if done == total || done % 64 == 0 {
+                progress(ProgressUpdate {
+                    phase: JobPhase::Fingerprint,
+                    processed: done,
+                    total,
+                    message: Some(format!("来源视觉指纹 {done}/{total}")),
+                    ..Default::default()
+                });
+            }
+        });
+    });
+    Ok(())
+}
+
 fn classify(
     ctx: &RootContext,
     prepared: &PreparedBatch,
@@ -293,6 +459,12 @@ fn classify(
         let db = lock_db(ctx)?;
         queries::load_library_images(&db, prepared.merchant_id)?
     };
+    let visual_library = if prepared.match_mode == MatchMode::Visual {
+        let db = lock_db(ctx)?;
+        queries::load_library_visuals(&db, prepared.merchant_id, HASH_VERSION)?
+    } else {
+        Vec::new()
+    };
     let total = items.len() as u64;
     progress(ProgressUpdate {
         phase: JobPhase::Comparing,
@@ -302,10 +474,32 @@ fn classify(
         ..Default::default()
     });
 
+    let mut visual_matches: Vec<Option<VisualLibraryMatch>> = vec![None; items.len()];
+    if prepared.match_mode == MatchMode::Visual && !visual_library.is_empty() {
+        progress(ProgressUpdate {
+            phase: JobPhase::Comparing,
+            total,
+            message: Some("正在执行主库视觉相似比对…".to_string()),
+            unique_count: counts.unique_count,
+            ..Default::default()
+        });
+        visual_matches = find_library_visual_matches(
+            items,
+            &library,
+            &visual_library,
+            prepared.visual_threshold,
+            cancel,
+        );
+        if cancel.load(Ordering::Relaxed) {
+            return Err(AppError::Cancelled);
+        }
+    }
+
     let mut seen_in_batch: HashMap<String, (i64, i64)> = HashMap::new();
+    let mut seen_visual: Vec<SeenVisual> = Vec::new();
     let mut processed = 0u64;
 
-    for item in items.iter_mut() {
+    for (index, item) in items.iter_mut().enumerate() {
         if cancel.load(Ordering::Relaxed) {
             return Err(AppError::Cancelled);
         }
@@ -324,6 +518,10 @@ fn classify(
                 message: Some(format!("已比对 {processed}/{total} 个文件")),
                 current_file: None,
             });
+        }
+
+        if item.warning_code.as_deref() == Some("VISUAL_UNAVAILABLE") {
+            counts.warning_count += 1;
         }
 
         if item.file.size_bytes == 0 {
@@ -363,6 +561,7 @@ fn classify(
                 Ok(metadata) if metadata.len() == existing.size_bytes as u64 => {
                     item.outcome = Some("duplicate_existing".to_string());
                     item.duplicate_of_image_id = Some(existing.id);
+                    item.duplicate_kind = Some("exact".to_string());
                     counts.duplicate_existing_count += 1;
                 }
                 Ok(_) => {
@@ -388,6 +587,29 @@ fn classify(
             continue;
         }
 
+        if let Some(candidate) = visual_matches.get(index).and_then(Option::as_ref) {
+            let existing = &visual_library[candidate.library_index];
+            let path = rel_to_path(&ctx.root, &existing.library_rel_path);
+            if fs::metadata(&path).is_ok() {
+                item.outcome = Some("duplicate_existing".to_string());
+                item.duplicate_of_image_id = Some(existing.image_id);
+                item.duplicate_kind = Some("visual".to_string());
+                item.visual_distance = Some(candidate.distance);
+                counts.duplicate_existing_count += 1;
+            } else {
+                set_item_error(
+                    item,
+                    "LIBRARY_FILE_MISSING",
+                    format!(
+                        "主库中的相似文件不存在：{}。请恢复主库文件，勿删除索引。",
+                        path.display()
+                    ),
+                );
+                counts.error_count += 1;
+            }
+            continue;
+        }
+
         if let Some((first_seq, first_size)) = seen_in_batch.get(&hash) {
             if *first_size != item.file.size_bytes {
                 set_item_error(
@@ -399,12 +621,35 @@ fn classify(
             } else {
                 item.outcome = Some("duplicate_in_batch".to_string());
                 item.duplicate_of_seq = Some(*first_seq);
+                item.duplicate_kind = Some("exact".to_string());
                 counts.duplicate_in_batch_count += 1;
             }
             continue;
         }
 
+        if prepared.match_mode == MatchMode::Visual {
+            if let Some(hashes) = &item.visual {
+                if let Some((first_seq, distance)) =
+                    find_batch_visual(&seen_visual, hashes, prepared.visual_threshold)
+                {
+                    item.outcome = Some("duplicate_in_batch".to_string());
+                    item.duplicate_of_seq = Some(first_seq);
+                    item.duplicate_kind = Some("visual".to_string());
+                    item.visual_distance = Some(distance);
+                    counts.duplicate_in_batch_count += 1;
+                    continue;
+                }
+            }
+        }
+
         seen_in_batch.insert(hash, (item.seq, item.file.size_bytes));
+        if let Some(hashes) = &item.visual {
+            seen_visual.push(SeenVisual {
+                seq: item.seq,
+                hash0: hashes.rotations[0],
+                aspect_ratio: hashes.aspect_ratio(),
+            });
+        }
         item.outcome = Some("unique".to_string());
         counts.unique_count += 1;
     }
@@ -423,6 +668,91 @@ fn classify(
         current_file: None,
     });
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct VisualLibraryMatch {
+    library_index: usize,
+    image_id: i64,
+    distance: u32,
+}
+
+struct SeenVisual {
+    seq: i64,
+    hash0: u64,
+    aspect_ratio: f32,
+}
+
+fn find_library_visual_matches(
+    items: &[WorkItem],
+    library: &HashMap<String, LibraryImage>,
+    visuals: &[LibraryVisual],
+    threshold: u32,
+    cancel: &AtomicBool,
+) -> Vec<Option<VisualLibraryMatch>> {
+    items
+        .par_iter()
+        .map(|item| {
+            if cancel.load(Ordering::Relaxed) {
+                return None;
+            }
+            if item.file.size_bytes <= 0 || item.outcome.as_deref() == Some("error") {
+                return None;
+            }
+            let hashes = item.visual.as_ref()?;
+            if let Some(hash) = &item.hash {
+                if library.contains_key(hash) {
+                    return None;
+                }
+            }
+
+            let aspect = hashes.aspect_ratio();
+            let mut best: Option<VisualLibraryMatch> = None;
+            for (index, entry) in visuals.iter().enumerate() {
+                if !visual::aspect_compatible(aspect, entry.aspect_ratio) {
+                    continue;
+                }
+                let distance = visual::best_distance(&hashes.rotations, entry.rotations[0]);
+                if distance > threshold {
+                    continue;
+                }
+                let better = best.as_ref().map_or(true, |current| {
+                    distance < current.distance
+                        || (distance == current.distance && entry.image_id < current.image_id)
+                });
+                if better {
+                    best = Some(VisualLibraryMatch {
+                        library_index: index,
+                        image_id: entry.image_id,
+                        distance,
+                    });
+                }
+            }
+            best
+        })
+        .collect()
+}
+
+fn find_batch_visual(
+    seen: &[SeenVisual],
+    hashes: &VisualHashes,
+    threshold: u32,
+) -> Option<(i64, u32)> {
+    let aspect = hashes.aspect_ratio();
+    let mut best: Option<(i64, u32)> = None;
+    for candidate in seen {
+        if !visual::aspect_compatible(aspect, candidate.aspect_ratio) {
+            continue;
+        }
+        let distance = visual::best_distance(&hashes.rotations, candidate.hash0);
+        if distance > threshold {
+            continue;
+        }
+        if best.map_or(true, |(_, current)| distance < current) {
+            best = Some((candidate.seq, distance));
+        }
+    }
+    best
 }
 
 fn copy_all(
@@ -564,6 +894,7 @@ fn copy_unique(
         original_source_path: absolute_string(&item.file.abs_path),
         imported_at: Local::now().to_rfc3339(),
         batch_id: prepared.batch_id,
+        visual: item.visual,
     };
 
     let commit = {
@@ -711,6 +1042,8 @@ fn finalize(
         started_at: &prepared.started_at,
         finished_at: &finished_at,
         status: status_text,
+        match_mode: prepared.match_mode.as_str(),
+        visual_threshold: prepared.visual_threshold,
     };
     let report_paths = write_batch_reports(
         &ctx.root,
@@ -799,6 +1132,8 @@ pub fn regenerate_report(ctx: &RootContext, batch_id: i64) -> AppResult<crate::m
         started_at: &batch.started_at,
         finished_at: &finished_at,
         status: &batch.status,
+        match_mode: &batch.match_mode,
+        visual_threshold: batch.visual_threshold,
     };
     let (report_rel_path, summary_rel_path) =
         write_batch_reports(&ctx.root, &meta, &counts, &items, &[], None)?;
@@ -973,6 +1308,8 @@ fn new_batch_item(item: &WorkItem) -> NewBatchItem {
             .outcome
             .clone()
             .unwrap_or_else(|| "skipped".to_string()),
+        duplicate_kind: item.duplicate_kind.clone(),
+        visual_distance: item.visual_distance,
         duplicate_of_image_id: item.duplicate_of_image_id,
         duplicate_of_seq: item.duplicate_of_seq,
         error_code: item.error_code.clone(),
@@ -1022,6 +1359,8 @@ fn report_items_from_state(items: &[WorkItem], status: &RunStatus) -> Vec<BatchR
                 size_bytes: Some(item.file.size_bytes),
                 sha256: item.hash.clone(),
                 outcome,
+                duplicate_kind: item.duplicate_kind.clone(),
+                visual_distance: item.visual_distance,
                 library_rel_path: None,
                 result_rel_path: None,
                 error_code: item.error_code.clone(),
@@ -1156,7 +1495,10 @@ struct WorkItem {
     seq: i64,
     file: ScannedFile,
     hash: Option<String>,
+    visual: Option<VisualHashes>,
     outcome: Option<String>,
+    duplicate_kind: Option<String>,
+    visual_distance: Option<u32>,
     duplicate_of_image_id: Option<i64>,
     duplicate_of_seq: Option<i64>,
     error_code: Option<String>,
@@ -1172,7 +1514,10 @@ impl WorkItem {
             seq,
             file,
             hash: None,
+            visual: None,
             outcome: None,
+            duplicate_kind: None,
+            visual_distance: None,
             duplicate_of_image_id: None,
             duplicate_of_seq: None,
             error_code: None,

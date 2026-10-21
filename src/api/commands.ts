@@ -10,6 +10,7 @@ import type {
   JobFailedPayload,
   JobFinishedPayload,
   JobProgress,
+  MatchMode,
   MerchantSummary,
   RootInspection,
   RootSnapshot,
@@ -48,6 +49,8 @@ export function startBatch(params: {
   merchantId: number;
   sourceDir: string;
   kind: BatchKind;
+  matchMode: MatchMode;
+  visualThreshold: number;
 }) {
   return invoke<StartBatchResult>("start_batch", params);
 }

@@ -18,6 +18,8 @@ pub struct ReportMeta<'a> {
     pub started_at: &'a str,
     pub finished_at: &'a str,
     pub status: &'a str,
+    pub match_mode: &'a str,
+    pub visual_threshold: u32,
 }
 
 pub fn write_batch_reports(
@@ -72,6 +74,8 @@ fn write_csv(path: &Path, root: &Path, items: &[BatchReportItem]) -> AppResult<(
                 "错误信息",
                 "警告码",
                 "警告信息",
+                "匹配方式",
+                "视觉差异",
             ])?;
 
             for item in items {
@@ -103,6 +107,10 @@ fn write_csv(path: &Path, root: &Path, items: &[BatchReportItem]) -> AppResult<(
                     excel_safe(item.error_message.as_deref().unwrap_or_default()),
                     item.warning_code.clone().unwrap_or_default(),
                     excel_safe(item.warning_message.as_deref().unwrap_or_default()),
+                    match_label(item.duplicate_kind.as_deref()).to_string(),
+                    item.visual_distance
+                        .map(|value| value.to_string())
+                        .unwrap_or_default(),
                 ])?;
             }
             writer.flush()?;
@@ -137,6 +145,8 @@ fn write_summary(
         "startedAt": meta.started_at,
         "finishedAt": meta.finished_at,
         "status": meta.status,
+        "matchMode": meta.match_mode,
+        "visualThreshold": meta.visual_threshold,
         "generatedAt": Local::now().to_rfc3339(),
         "counts": {
             "totalFiles": counts.total_files,
@@ -167,15 +177,26 @@ fn write_summary(
 }
 
 fn duplicate_description(item: &BatchReportItem) -> (String, String) {
+    let visual = item.duplicate_kind.as_deref() == Some("visual");
     if let Some(name) = &item.duplicate_image_name {
         let path = item.duplicate_image_path.as_deref().unwrap_or_default();
-        return ("已有主库".to_string(), format!("{name}（{path}）"));
+        let source = if visual { "主库视觉相似" } else { "已有主库" };
+        return (source.to_string(), format!("{name}（{path}）"));
     }
     if let Some(name) = &item.duplicate_item_name {
         let path = item.duplicate_item_source.as_deref().unwrap_or_default();
-        return ("同批次".to_string(), format!("{name}（{path}）"));
+        let source = if visual { "同批次视觉相似" } else { "同批次" };
+        return (source.to_string(), format!("{name}（{path}）"));
     }
     (String::new(), String::new())
+}
+
+fn match_label(kind: Option<&str>) -> &'static str {
+    match kind {
+        Some("exact") => "精确哈希",
+        Some("visual") => "视觉相似",
+        _ => "",
+    }
 }
 
 fn outcome_label(outcome: &str) -> &'static str {

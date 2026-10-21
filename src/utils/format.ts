@@ -1,4 +1,4 @@
-import type { BatchKind, BatchStatus, JobPhase } from "../api/types";
+import type { BatchKind, BatchStatus, JobPhase, MatchMode } from "../api/types";
 
 export function formatBytes(value: number): string {
   if (!Number.isFinite(value) || value <= 0) return "0 B";
@@ -37,6 +37,16 @@ export function errorMessage(error: unknown): string {
 
 export function batchKindLabel(kind: BatchKind): string {
   return kind === "initial_import" ? "首次导入" : "日常批量去重";
+}
+
+export function matchModeLabel(mode: MatchMode): string {
+  return mode === "visual" ? "视觉相似" : "精确哈希";
+}
+
+export function visualThresholdLabel(value: number): string {
+  if (value <= 4) return "严格";
+  if (value >= 12) return "宽松";
+  return "标准";
 }
 
 export function batchStatusMeta(status: BatchStatus): {
@@ -81,6 +91,7 @@ export function outcomeLabel(outcome: string): string {
 export const phaseOrder: JobPhase[] = [
   "scanning",
   "hashing",
+  "fingerprint",
   "comparing",
   "copying",
   "finalizing",
@@ -92,6 +103,8 @@ export function phaseLabel(phase: JobPhase): string {
       return "扫描文件";
     case "hashing":
       return "计算哈希";
+    case "fingerprint":
+      return "视觉指纹";
     case "comparing":
       return "比对主库";
     case "copying":

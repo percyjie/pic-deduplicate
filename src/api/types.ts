@@ -1,8 +1,11 @@
 export type BatchKind = "initial_import" | "daily";
 
+export type MatchMode = "exact" | "visual";
+
 export type JobPhase =
   | "scanning"
   | "hashing"
+  | "fingerprint"
   | "comparing"
   | "copying"
   | "finalizing";
@@ -97,6 +100,9 @@ export interface BatchSummary {
   skippedCount: number;
   errorCount: number;
   warningCount: number;
+  visualDuplicateCount: number;
+  matchMode: MatchMode;
+  visualThreshold: number;
   reportPath: string | null;
   note: string | null;
 }

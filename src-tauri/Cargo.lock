@@ -2592,7 +2592,7 @@ dependencies = [
 
 [[package]]
 name = "pic-deduplicate"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "csv",
@@ -2613,6 +2613,7 @@ dependencies = [
  "thiserror 2.0.21",
  "uuid",
  "walkdir",
+ "windows",
  "windows-sys 0.59.0",
 ]
 

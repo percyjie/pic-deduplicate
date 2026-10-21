@@ -6,6 +6,7 @@ import type {
   BatchKind,
   JobFinishedPayload,
   JobProgress,
+  MatchMode,
   RootSnapshot,
 } from "../api/types";
 
@@ -15,6 +16,8 @@ export interface PendingBatch {
   merchantId: number;
   kind: BatchKind;
   sourceDir?: string;
+  matchMode?: MatchMode;
+  visualThreshold?: number;
 }
 
 interface AppStore {

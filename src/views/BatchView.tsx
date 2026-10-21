@@ -22,6 +22,7 @@ import {
   InboxOutlined,
   LoadingOutlined,
   ReloadOutlined,
+  ScanOutlined,
   StopOutlined,
   ThunderboltOutlined,
 } from "@ant-design/icons";
@@ -32,7 +33,7 @@ import {
   openResultDir,
   startBatch,
 } from "../api/commands";
-import type { BatchKind } from "../api/types";
+import type { BatchKind, MatchMode } from "../api/types";
 import { useAppStore } from "../store/appStore";
 import {
   batchKindLabel,
@@ -40,9 +41,17 @@ import {
   errorMessage,
   formatDateTime,
   formatNumber,
+  matchModeLabel,
   phaseLabel,
   phaseOrder,
+  visualThresholdLabel,
 } from "../utils/format";
+
+const thresholdOptions = [
+  { value: 4, label: "严格" },
+  { value: 8, label: "标准" },
+  { value: 12, label: "宽松" },
+];
 
 function BatchView() {
   const { message, modal } = AntdApp.useApp();
@@ -55,13 +64,27 @@ function BatchView() {
   const setView = useAppStore((state) => state.setView);
   const [sourceDir, setSourceDir] = useState(pendingBatch?.sourceDir ?? "");
   const [kind, setKind] = useState<BatchKind>(pendingBatch?.kind ?? "daily");
+  const [matchMode, setMatchMode] = useState<MatchMode>(
+    pendingBatch?.matchMode ?? "exact",
+  );
+  const [visualThreshold, setVisualThreshold] = useState(
+    pendingBatch?.visualThreshold ?? 8,
+  );
   const [starting, setStarting] = useState(false);
   const [cancelling, setCancelling] = useState(false);
 
   useEffect(() => {
     setSourceDir(pendingBatch?.sourceDir ?? "");
     setKind(pendingBatch?.kind ?? "daily");
-  }, [pendingBatch?.merchantId, pendingBatch?.kind, pendingBatch?.sourceDir]);
+    setMatchMode(pendingBatch?.matchMode ?? "exact");
+    setVisualThreshold(pendingBatch?.visualThreshold ?? 8);
+  }, [
+    pendingBatch?.merchantId,
+    pendingBatch?.kind,
+    pendingBatch?.sourceDir,
+    pendingBatch?.matchMode,
+    pendingBatch?.visualThreshold,
+  ]);
 
   if (!snapshot) return null;
 
@@ -109,6 +132,11 @@ function BatchView() {
           <p>
             模式：<strong>{batchKindLabel(kind)}</strong>
           </p>
+          <p>
+            比对方式：<strong>{matchModeLabel(matchMode)}</strong>
+            {matchMode === "visual" &&
+              `（${visualThresholdLabel(visualThreshold)}，差异 ≤ ${visualThreshold}）`}
+          </p>
           <p className="start-confirm-path">{sourceDir}</p>
           <p>
             源文件不会被修改。唯一图片会复制到主库，同时本次的重复和不重复图片会复制到新的批次结果目录。
@@ -121,6 +149,14 @@ function BatchView() {
                 setupMerchant.imageCount,
               )} 张图片`}
               description="本次依然只新增唯一图片；与主库重复的文件会进入“重复”目录。"
+            />
+          )}
+          {matchMode === "visual" && (
+            <Alert
+              type="info"
+              showIcon
+              message="视觉相似模式"
+              description="会额外识别重新压缩、缩放和 90° 旋转的图片。相似判定会写入报告，建议抽查标记为“视觉相似”的记录。"
             />
           )}
         </div>
@@ -138,9 +174,16 @@ function BatchView() {
         merchantId,
         sourceDir,
         kind,
+        matchMode,
+        visualThreshold,
       });
       const store = useAppStore.getState();
-      if (!store.activeJob || store.activeJob.jobId !== result.jobId) {
+      const finishedEarly =
+        store.lastFinished?.batch.id === result.batchId;
+      if (
+        !finishedEarly &&
+        (!store.activeJob || store.activeJob.jobId !== result.jobId)
+      ) {
         store.setActiveJob({
           jobId: result.jobId,
           batchId: result.batchId,
@@ -315,6 +358,13 @@ function BatchView() {
                 >
                   {batchKindLabel(lastFinished.batch.batchType)}
                 </Tag>
+                <Tag
+                  color={
+                    lastFinished.batch.matchMode === "visual" ? "cyan" : "green"
+                  }
+                >
+                  {matchModeLabel(lastFinished.batch.matchMode)}
+                </Tag>
               </h2>
               <div className="job-sub">
                 {lastFinished.batch.merchantName} · 批次 #
@@ -391,6 +441,12 @@ function BatchView() {
               <span>同批次重复</span>
               <strong>
                 {formatNumber(lastFinished.batch.duplicateInBatchCount)}
+              </strong>
+            </div>
+            <div>
+              <span>其中视觉相似</span>
+              <strong>
+                {formatNumber(lastFinished.batch.visualDuplicateCount)}
               </strong>
             </div>
             <div>
@@ -495,6 +551,53 @@ function BatchView() {
                 : "用于第一次导入历史图片。除了与主库比对，还会对本次历史图片内部去重，只把唯一图片写入主库。"}
             </p>
 
+            <div className="compare-block">
+              <div className="source-label">比对方式</div>
+              <Segmented
+                block
+                value={matchMode}
+                onChange={(value) => setMatchMode(value as MatchMode)}
+                options={[
+                  {
+                    value: "exact",
+                    label: (
+                      <span className="segment-label">
+                        <CheckCircleOutlined /> 精确哈希
+                      </span>
+                    ),
+                  },
+                  {
+                    value: "visual",
+                    label: (
+                      <span className="segment-label">
+                        <ScanOutlined /> 视觉相似
+                      </span>
+                    ),
+                  },
+                ]}
+              />
+              {matchMode === "visual" && (
+                <div className="threshold-row">
+                  <span>相似灵敏度</span>
+                  <Segmented
+                    size="small"
+                    value={visualThreshold}
+                    onChange={(value) =>
+                      setVisualThreshold(value as number)
+                    }
+                    options={thresholdOptions}
+                  />
+                </div>
+              )}
+              <p className="compare-description">
+                {matchMode === "exact"
+                  ? "只有文件内容完全一致才判定为重复，结果最稳妥。"
+                  : `可识别重新压缩、缩放和 90° 旋转的图片，当前为${visualThresholdLabel(
+                      visualThreshold,
+                    )}（差异 ≤ ${visualThreshold}）。阈值越高越宽松，误判风险也越高。`}
+              </p>
+            </div>
+
             {kind === "initial_import" && setupMerchant.imageCount > 0 && (
               <Alert
                 type="warning"
@@ -562,6 +665,11 @@ function BatchView() {
                     description: "流式读取文件，完成后校验文件未被改动。",
                   },
                   {
+                    title: "视觉指纹（视觉模式）",
+                    description:
+                      "为主库与来源图片生成感知指纹，识别压缩、缩放与 90° 旋转。",
+                  },
+                  {
                     title: "与主库比对",
                     description: "识别主库已有重复、同批次重复与唯一图片。",
                   },
@@ -588,11 +696,25 @@ function BatchView() {
             />
 
             <Alert
-              type="success"
+              type={matchMode === "visual" ? "warning" : "success"}
               showIcon
-              icon={<CheckCircleOutlined />}
-              message="精确去重，不做视觉相似"
-              description="只有文件内容完全一致才会判定为重复。重新压缩或缩放后的图片不会被误判。"
+              icon={
+                matchMode === "visual" ? (
+                  <ScanOutlined />
+                ) : (
+                  <CheckCircleOutlined />
+                )
+              }
+              message={
+                matchMode === "visual"
+                  ? "视觉相似模式可能产生少量误判"
+                  : "精确哈希模式，不做视觉相似"
+              }
+              description={
+                matchMode === "visual"
+                  ? "压缩、缩放与 90° 旋转的图片会被识别为重复；请抽查报告中标记“视觉相似”的记录。"
+                  : "只有文件内容完全一致才会判定为重复。重新压缩或缩放后的图片不会被误判。"
+              }
             />
           </div>
         </div>
@@ -620,6 +742,8 @@ function BatchView() {
                 merchantId: lastFinished.batch.merchantId,
                 kind: lastFinished.batch.batchType,
                 sourceDir: lastFinished.batch.sourceAbsPath,
+                matchMode: lastFinished.batch.matchMode,
+                visualThreshold: lastFinished.batch.visualThreshold,
               })
             }
           >
